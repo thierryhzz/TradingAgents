@@ -5,10 +5,23 @@ from pathlib import Path
 import json
 from datetime import date
 from typing import Dict, Any, Tuple, List, Optional
+import time
+
+from dotenv import load_dotenv
 
 from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
 from langchain_google_genai import ChatGoogleGenerativeAI
+
+# Ensure .env is loaded before any LLM initialization
+load_dotenv()
+
+# Configuration for API quota handling
+API_QUOTA_RETRY_CONFIG = {
+    "max_retries": 3,
+    "initial_wait_seconds": 60,  # Wait 1 minute before first retry
+    "backoff_multiplier": 2,     # Exponential backoff: 1min, 2min, 4min
+}
 
 from langgraph.prebuilt import ToolNode
 
@@ -43,6 +56,34 @@ from .reflection import Reflector
 from .signal_processing import SignalProcessor
 
 
+def retry_on_quota_error(func):
+    """
+    Decorator to retry API calls with exponential backoff when quota is exceeded.
+    Catches RateLimitError (429) and waits before retrying.
+    """
+    def wrapper(*args, **kwargs):
+        wait_time = API_QUOTA_RETRY_CONFIG["initial_wait_seconds"]
+        max_retries = API_QUOTA_RETRY_CONFIG["max_retries"]
+        
+        for attempt in range(max_retries + 1):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                # Check if it's a quota/rate limit error
+                if "429" in str(e) or "insufficient_quota" in str(e) or "exceeded your current quota" in str(e):
+                    if attempt < max_retries:
+                        print(f"\n⚠️  API Quota Limit Hit (429). Waiting {wait_time}s before retry {attempt + 1}/{max_retries}...")
+                        time.sleep(wait_time)
+                        wait_time *= API_QUOTA_RETRY_CONFIG["backoff_multiplier"]
+                    else:
+                        print(f"\n❌ API Quota Limit exceeded after {max_retries} retries. Please check your OpenAI billing at https://platform.openai.com/account/billing/overview")
+                        raise
+                else:
+                    raise
+    
+    return wrapper
+
+
 class TradingAgentsGraph:
     """Main class that orchestrates the trading agents framework."""
 
@@ -73,8 +114,18 @@ class TradingAgentsGraph:
 
         # Initialize LLMs
         if self.config["llm_provider"].lower() == "openai" or self.config["llm_provider"] == "ollama" or self.config["llm_provider"] == "openrouter":
-            self.deep_thinking_llm = ChatOpenAI(model=self.config["deep_think_llm"], base_url=self.config["backend_url"])
-            self.quick_thinking_llm = ChatOpenAI(model=self.config["quick_think_llm"], base_url=self.config["backend_url"])
+            # Prefer explicit API key from environment to avoid relying on implicit global state
+            openai_api_key = os.getenv("OPENAI_API_KEY")
+            self.deep_thinking_llm = ChatOpenAI(
+                model=self.config["deep_think_llm"],
+                base_url=self.config["backend_url"],
+                api_key=openai_api_key,
+            )
+            self.quick_thinking_llm = ChatOpenAI(
+                model=self.config["quick_think_llm"],
+                base_url=self.config["backend_url"],
+                api_key=openai_api_key,
+            )
         elif self.config["llm_provider"].lower() == "anthropic":
             self.deep_thinking_llm = ChatAnthropic(model=self.config["deep_think_llm"], base_url=self.config["backend_url"])
             self.quick_thinking_llm = ChatAnthropic(model=self.config["quick_think_llm"], base_url=self.config["backend_url"])
@@ -169,19 +220,11 @@ class TradingAgentsGraph:
         args = self.propagator.get_graph_args()
 
         if self.debug:
-            # Debug mode with tracing
-            trace = []
-            for chunk in self.graph.stream(init_agent_state, **args):
-                if len(chunk["messages"]) == 0:
-                    pass
-                else:
-                    chunk["messages"][-1].pretty_print()
-                    trace.append(chunk)
-
-            final_state = trace[-1]
+            # Debug mode with tracing - also with retry logic
+            final_state = self._stream_with_quota_retry(init_agent_state, args)
         else:
-            # Standard mode without tracing
-            final_state = self.graph.invoke(init_agent_state, **args)
+            # Standard mode without tracing - with quota error handling
+            final_state = self._invoke_with_quota_retry(init_agent_state, args)
 
         # Store current state for reflection
         self.curr_state = final_state
@@ -191,6 +234,133 @@ class TradingAgentsGraph:
 
         # Return decision and processed signal
         return final_state, self.process_signal(final_state["final_trade_decision"])
+
+    def _stream_with_quota_retry(self, init_agent_state, args):
+        """
+        Stream the graph (debug mode) with automatic retry on OpenAI quota errors.
+        """
+        if not self.config.get("enable_quota_retry", True):
+            # Retry disabled, stream normally
+            trace = []
+            response_content = []
+            for chunk in self.graph.stream(init_agent_state, **args):
+                if len(chunk["messages"]) == 0:
+                    pass
+                else:
+                    chunk["messages"][-1].pretty_print()
+                    trace.append(chunk)
+                    if hasattr(chunk["messages"][-1], "content"):
+                        response_content.append(str(chunk["messages"][-1].content))
+            
+            full_response = " ".join(response_content)
+            first_100_words = " ".join(full_response.split()[:100])
+            print(f"\n✅ Successfully received valid response from OpenAI")
+            print(f"First 100 words: {first_100_words}...\n")
+            return trace[-1]
+        
+        max_retries = self.config.get("max_quota_retries", 3)
+        wait_time = self.config.get("quota_retry_wait_seconds", 60)
+        
+        for attempt in range(max_retries + 1):
+            response_content = []
+            try:
+                trace = []
+                for chunk in self.graph.stream(init_agent_state, **args):
+                    if len(chunk["messages"]) == 0:
+                        pass
+                    else:
+                        chunk["messages"][-1].pretty_print()
+                        trace.append(chunk)
+                        if hasattr(chunk["messages"][-1], "content"):
+                            response_content.append(str(chunk["messages"][-1].content))
+                
+                # Success! Print confirmation message with response preview
+                full_response = " ".join(response_content)
+                first_100_words = " ".join(full_response.split()[:100])
+                print(f"\n✅ Successfully received valid response from OpenAI")
+                print(f"First 100 words: {first_100_words}...\n")
+                return trace[-1]
+            except Exception as e:
+                error_str = str(e).lower()
+                error_type = type(e).__name__.lower()
+                
+                is_quota_error = (
+                    "429" in error_str or
+                    "insufficient_quota" in error_str or
+                    "exceeded your current quota" in error_str or
+                    "quota" in error_str or
+                    "rate limit" in error_str or
+                    "ratelimiterror" in error_type
+                )
+                
+                if is_quota_error:
+                    if attempt < max_retries:
+                        print(f"\n⚠️  OpenAI API Quota Limit Hit - Waiting {wait_time} seconds before retry {attempt + 1}/{max_retries}...")
+                        print(f"   (Error: {str(e)[:100]}...)")
+                        time.sleep(wait_time)
+                        wait_time *= 2
+                    else:
+                        print(f"\n❌ OpenAI API Quota still exceeded after {max_retries} retries.")
+                        print(f"❌ Please check your billing: https://platform.openai.com/account/billing/overview")
+                        print(f"❌ Original error: {str(e)}")
+                        raise
+                else:
+                    raise
+
+    def _invoke_with_quota_retry(self, init_agent_state, args):
+        """
+        Invoke the graph with automatic retry on OpenAI quota errors (429).
+        Implements exponential backoff to wait for quota to reset.
+        """
+        if not self.config.get("enable_quota_retry", True):
+            # Retry disabled, invoke normally
+            return self.graph.invoke(init_agent_state, **args)
+        
+        max_retries = self.config.get("max_quota_retries", 3)
+        wait_time = self.config.get("quota_retry_wait_seconds", 60)
+        
+        for attempt in range(max_retries + 1):
+            try:
+                result = self.graph.invoke(init_agent_state, **args)
+                # Success! Print confirmation message with response preview
+                response_text = ""
+                if "final_trade_decision" in result and result["final_trade_decision"]:
+                    response_text = str(result["final_trade_decision"])
+                elif len(result.get("messages", [])) > 0:
+                    response_text = str(result["messages"][-1].content if hasattr(result["messages"][-1], "content") else result["messages"][-1])
+                
+                first_100_words = " ".join(response_text.split()[:100])
+                print(f"\n✅ Successfully received valid response from OpenAI")
+                print(f"First 100 words: {first_100_words}...\n")
+                return result
+            except Exception as e:
+                error_str = str(e).lower()
+                error_type = type(e).__name__.lower()
+                
+                # Check if it's a quota error with more flexible matching
+                is_quota_error = (
+                    "429" in error_str or
+                    "insufficient_quota" in error_str or
+                    "exceeded your current quota" in error_str or
+                    "quota" in error_str or
+                    "rate limit" in error_str or
+                    "ratelimiterror" in error_type
+                )
+                
+                if is_quota_error:
+                    if attempt < max_retries:
+                        print(f"\n⚠️  OpenAI API Quota Limit Hit - Waiting {wait_time} seconds before retry {attempt + 1}/{max_retries}...")
+                        print(f"   (Error: {str(e)[:100]}...)")
+                        time.sleep(wait_time)
+                        wait_time *= 2  # Exponential backoff: double the wait time
+                    else:
+                        print(f"\n❌ OpenAI API Quota still exceeded after {max_retries} retries.")
+                        print(f"❌ Please check your billing: https://platform.openai.com/account/billing/overview")
+                        print(f"❌ Original error: {str(e)}")
+                        raise
+                else:
+                    # Not a quota error, raise immediately
+                    raise
 
     def _log_state(self, trade_date, final_state):
         """Log the final state to a JSON file."""

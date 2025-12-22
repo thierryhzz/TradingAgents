@@ -13,6 +13,10 @@ DEFAULT_CONFIG = {
     "deep_think_llm": "o4-mini",
     "quick_think_llm": "gpt-4o-mini",
     "backend_url": "https://api.openai.com/v1",
+    # API quota handling
+    "enable_quota_retry": True,  # Retry with exponential backoff on 429 quota errors
+    "max_quota_retries": 3,      # Max number of retries when quota exceeded
+    "quota_retry_wait_seconds": 60,  # Initial wait time (doubles with each retry)
     # Debate and discussion settings
     "max_debate_rounds": 1,
     "max_risk_discuss_rounds": 1,
