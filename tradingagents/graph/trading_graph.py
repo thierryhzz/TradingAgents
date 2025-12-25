@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_ollama import ChatOllama
 
 # Ensure .env is loaded before any LLM initialization
 load_dotenv()
@@ -113,8 +114,31 @@ class TradingAgentsGraph:
         )
 
         # Initialize LLMs
-        if self.config["llm_provider"].lower() == "openai" or self.config["llm_provider"] == "ollama" or self.config["llm_provider"] == "openrouter":
-            # Prefer explicit API key from environment to avoid relying on implicit global state
+        if self.config["llm_provider"].lower() == "openai":
+            # Use OpenAI with explicit API key
+            openai_api_key = os.getenv("OPENAI_API_KEY")
+            self.deep_thinking_llm = ChatOpenAI(
+                model=self.config["deep_think_llm"],
+                base_url=self.config["backend_url"],
+                api_key=openai_api_key,
+            )
+            self.quick_thinking_llm = ChatOpenAI(
+                model=self.config["quick_think_llm"],
+                base_url=self.config["backend_url"],
+                api_key=openai_api_key,
+            )
+        elif self.config["llm_provider"].lower() == "ollama":
+            # Use Ollama (local LLM)
+            self.deep_thinking_llm = ChatOllama(
+                model=self.config["deep_think_llm"],
+                base_url=self.config["backend_url"],
+            )
+            self.quick_thinking_llm = ChatOllama(
+                model=self.config["quick_think_llm"],
+                base_url=self.config["backend_url"],
+            )
+        elif self.config["llm_provider"].lower() == "openrouter":
+            # Use OpenRouter
             openai_api_key = os.getenv("OPENAI_API_KEY")
             self.deep_thinking_llm = ChatOpenAI(
                 model=self.config["deep_think_llm"],
