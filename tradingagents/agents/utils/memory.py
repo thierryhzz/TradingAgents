@@ -1,25 +1,64 @@
 import chromadb
 from chromadb.config import Settings
 from openai import OpenAI
+import requests
 
 
 class FinancialSituationMemory:
     def __init__(self, name, config):
-        if config["backend_url"] == "http://localhost:11434/v1":
+        self.config = config
+        self.backend_url = config["backend_url"]
+        self.llm_provider = config.get("llm_provider", "openai").lower()
+        
+        if self.llm_provider == "ollama":
             self.embedding = "nomic-embed-text"
+            self.client = None  # Use requests instead
         else:
             self.embedding = "text-embedding-3-small"
-        self.client = OpenAI(base_url=config["backend_url"])
+            self.client = OpenAI(base_url=self.backend_url)
+        
         self.chroma_client = chromadb.Client(Settings(allow_reset=True))
         self.situation_collection = self.chroma_client.create_collection(name=name)
 
     def get_embedding(self, text):
-        """Get OpenAI embedding for a text"""
+        """Get embedding for a text using the configured provider"""
         
-        response = self.client.embeddings.create(
-            model=self.embedding, input=text
-        )
-        return response.data[0].embedding
+        if self.llm_provider == "ollama":
+            # Use Ollama embeddings endpoint
+            try:
+                response = requests.post(
+                    f"{self.backend_url}/api/embeddings",
+                    json={"model": self.embedding, "prompt": text},
+                    timeout=30
+                )
+                response.raise_for_status()
+                result = response.json()
+                # Ollama returns embedding in "embedding" key
+                if "embedding" in result:
+                    return result["embedding"]
+                else:
+                    raise ValueError(f"Unexpected Ollama response format: {result}")
+            except requests.exceptions.ConnectionError as e:
+                raise RuntimeError(
+                    f"Cannot connect to Ollama at {self.backend_url}. "
+                    f"Make sure Ollama is running: 'ollama serve'\n"
+                    f"Error: {str(e)}"
+                )
+            except requests.exceptions.HTTPError as e:
+                if response.status_code == 404:
+                    raise RuntimeError(
+                        f"404 Error: Model '{self.embedding}' not found on Ollama. "
+                        f"Install it with: 'ollama pull {self.embedding}'\n"
+                        f"Error: {str(e)}"
+                    )
+                else:
+                    raise RuntimeError(f"Ollama API error: {str(e)}\nResponse: {response.text}")
+        else:
+            # Use OpenAI embeddings
+            response = self.client.embeddings.create(
+                model=self.embedding, input=text
+            )
+            return response.data[0].embedding
 
     def add_situations(self, situations_and_advice):
         """Add financial situations and their corresponding advice. Parameter is a list of tuples (situation, rec)"""
@@ -45,7 +84,7 @@ class FinancialSituationMemory:
         )
 
     def get_memories(self, current_situation, n_matches=1):
-        """Find matching recommendations using OpenAI embeddings"""
+        """Find matching recommendations using configured embeddings provider (Ollama or OpenAI)"""
         query_embedding = self.get_embedding(current_situation)
 
         results = self.situation_collection.query(

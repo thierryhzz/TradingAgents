@@ -5,6 +5,7 @@ from pathlib import Path
 from functools import wraps
 from rich.console import Console
 from dotenv import load_dotenv
+import time
 
 # Load environment variables from .env file
 load_dotenv()
@@ -735,6 +736,76 @@ def extract_content_string(content):
     else:
         return str(content)
 
+
+def stream_with_quota_retry(graph, init_agent_state, args, config):
+    """
+    Stream graph execution with automatic retry on OpenAI quota errors (429).
+    Implements exponential backoff to wait for quota to reset.
+    """
+    if not config.get("enable_quota_retry", True):
+        # Retry disabled, stream normally
+        response_text = []
+        for chunk in graph.stream(init_agent_state, **args):
+            yield chunk
+            # Collect response content
+            if len(chunk.get("messages", [])) > 0:
+                last_msg = chunk["messages"][-1]
+                if hasattr(last_msg, "content"):
+                    response_text.append(str(last_msg.content))
+        
+        full_response = " ".join(response_text)
+        first_100_words = " ".join(full_response.split()[:100])
+        console.print(f"[bold green]✅ Successfully received valid response from OpenAI[/]")
+        console.print(f"[green]First 100 words:[/] {first_100_words}...\n")
+        return
+    
+    max_retries = config.get("max_quota_retries", 3)
+    wait_time = config.get("quota_retry_wait_seconds", 60)
+    
+    for attempt in range(max_retries + 1):
+        response_text = []
+        try:
+            for chunk in graph.stream(init_agent_state, **args):
+                yield chunk
+                # Collect response content
+                if len(chunk.get("messages", [])) > 0:
+                    last_msg = chunk["messages"][-1]
+                    if hasattr(last_msg, "content"):
+                        response_text.append(str(last_msg.content))
+            
+            # Success! Print confirmation message with response preview
+            full_response = " ".join(response_text)
+            first_100_words = " ".join(full_response.split()[:100])
+            console.print(f"[bold green]✅ Successfully received valid response from OpenAI[/]")
+            console.print(f"[green]First 100 words:[/] {first_100_words}...\n")
+            return
+        except Exception as e:
+            error_str = str(e).lower()
+            error_type = type(e).__name__.lower()
+            
+            is_quota_error = (
+                "429" in error_str or
+                "insufficient_quota" in error_str or
+                "exceeded your current quota" in error_str or
+                "quota" in error_str or
+                "rate limit" in error_str or
+                "ratelimiterror" in error_type
+            )
+            
+            if is_quota_error:
+                if attempt < max_retries:
+                    console.print(f"\n[bold red]⚠️  OpenAI API Quota Limit Hit[/] - Waiting {wait_time} seconds before retry {attempt + 1}/{max_retries}...")
+                    console.print(f"   (Error: {str(e)[:100]}...)")
+                    time.sleep(wait_time)
+                    wait_time *= 2  # Exponential backoff
+                else:
+                    console.print(f"\n[bold red]❌ OpenAI API Quota still exceeded after {max_retries} retries.[/]")
+                    console.print(f"[bold red]❌ Please check your billing:[/] https://platform.openai.com/account/billing/overview")
+                    console.print(f"[bold red]❌ Original error:[/] {str(e)}")
+                    raise
+            else:
+                raise
+
 def run_analysis():
     # First get all user selections
     selections = get_user_selections()
@@ -845,9 +916,9 @@ def run_analysis():
         )
         args = graph.propagator.get_graph_args()
 
-        # Stream the analysis
+        # Stream the analysis with quota error retry handling
         trace = []
-        for chunk in graph.graph.stream(init_agent_state, **args):
+        for chunk in stream_with_quota_retry(graph.graph, init_agent_state, args, config):
             if len(chunk["messages"]) > 0:
                 # Get the last message from the chunk
                 last_message = chunk["messages"][-1]

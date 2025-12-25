@@ -8,8 +8,8 @@ load_dotenv()
 
 # Create a custom config
 config = DEFAULT_CONFIG.copy()
-config["deep_think_llm"] = "gpt-4o-mini"  # Use a different model
-config["quick_think_llm"] = "gpt-4o-mini"  # Use a different model
+config["deep_think_llm"] = "llama3.1:8b"  # Use a different model
+config["quick_think_llm"] = "llama3.1:8b"  # Use a different model
 config["max_debate_rounds"] = 1  # Increase debate rounds
 
 # Configure data vendors (default uses yfinance and alpha_vantage)
@@ -24,7 +24,7 @@ config["data_vendors"] = {
 ta = TradingAgentsGraph(debug=True, config=config)
 
 # forward propagate
-_, decision = ta.propagate("NVDA", "2024-05-10")
+_, decision = ta.propagate("TSLA", "2025-05-10")
 print(decision)
 
 # Memorize mistakes and reflect
